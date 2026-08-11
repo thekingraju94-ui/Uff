@@ -1,0 +1,9 @@
+name = "firexpanel-worker"
+main = "src/worker.js"
+compatibility_date = "2024-01-01"
+
+# BOT_TOKEN and ADMIN_ID are set as encrypted secrets via:
+#   npx wrangler secret put BOT_TOKEN
+#   npx wrangler secret put ADMIN_ID
+# They are NEVER stored in this file or any config file.
+# Cloudflare encrypts them at rest — not visible in dashboard after setting.
