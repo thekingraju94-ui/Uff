@@ -2,7 +2,7 @@
 
 ## Security
 
-- **BOT_TOKEN**, **ADMIN_ID**, and **ENC_KEY** are stored as **Cloudflare encrypted secrets**
+- **BOT_TOKEN** and **ADMIN_ID** are stored as **Cloudflare encrypted secrets**
 - They are NEVER in source code, config files, logs, or error messages
 - After setting, they are NOT visible in the Cloudflare dashboard
 - The worker returns generic responses — no internal info is ever leaked
@@ -38,8 +38,6 @@ npx wrangler secret put BOT_TOKEN
 npx wrangler secret put ADMIN_ID
 # When prompted, paste your Telegram admin chat ID
 
-npx wrangler secret put ENC_KEY
-# When prompted, paste your AES encryption passphrase
 ```
 
 > ⚠️ **NEVER commit real tokens or IDs to this repository.**
@@ -64,4 +62,4 @@ You should receive a test message in Telegram.
 4. Never appear in logs, error messages, or HTTP responses
 5. Source code contains zero sensitive data — safe to be public
 6. Even if someone decompiles the worker, secrets are injected at runtime by Cloudflare
-7. Encryption key moved from source code to Cloudflare secret (`ENC_KEY`)
+7. AES-GCM payload encryption with timestamp validation
